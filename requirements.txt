@@ -3,3 +3,4 @@
 lgpio
 gpiozero
 smbus
+RPI.BME280
