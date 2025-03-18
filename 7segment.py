@@ -103,6 +103,16 @@ class TM1637:
     def cleanup(self):
         lgpio.gpiochip_close(self.handle)
 
+    def clear(self):
+        """Turn off all segments of the display"""
+        self._write_data_cmd()
+        self._start()
+        self._write_byte(TM1637_CMD2)
+        for _ in range(4):  # 4 digits in the display
+            self._write_byte(0)  # Write 0 to turn off all segments
+        self._stop()
+        self._write_dsp_ctrl()
+
 
 # ใช้งาน TM1637
 tm = TM1637(CLK, DIO)
@@ -114,4 +124,5 @@ tm.show("0123")
 sleep(2)
 tm.show("4569")
 sleep(2)
+tm.clear()
 tm.cleanup()
