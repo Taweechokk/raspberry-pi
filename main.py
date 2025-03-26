@@ -5,9 +5,11 @@ from time import sleep
 from gpiozero import *
 import board
 import adafruit_dht
+import smbus
+import bme280
 
 # ตั้งค่าพอร์ตอนุกรมเสมือน
-SERIAL_PORT = "/dev/pts/5"  # ใช้ Virtual Serial Port ที่สร้างจาก tty0tty
+SERIAL_PORT = "/dev/pts/4"  # ใช้ Virtual Serial Port ที่สร้างจาก tty0tty
 BAUD_RATE = 9600
 
 # ser = serial.Serial('/dev/pts/5', baudrate=9600, timeout=1)
@@ -54,6 +56,91 @@ def __patched_init(self, chip=None):
     self._chip = chip
     self.pin_class = gpiozero.pins.lgpio.LGPIOPin
 
+gpio_devices = {}
+
+def digitalWrite(pin, value):
+    global gpio_devices
+    if pin not in gpio_devices or not isinstance(gpio_devices[pin], DigitalOutputDevice):
+        gpio_devices[pin] = DigitalOutputDevice(pin=pin)
+        
+    digitalDevice = gpio_devices[pin]
+
+    if value == 1:
+        digitalDevice.on()
+        print(f"✅ GPIO{pin} ON")
+    elif value == 0:
+        digitalDevice.off()
+        digitalDevice.close()        # ✅ ปิดอุปกรณ์
+        del gpio_devices[pin]         # ✅ ลบออกจาก dict
+        print(f"🛑 GPIO{pin} OFF & released")
+    else:
+        print("Invalid value")
+
+def analogWrite(pin, freq, duty):
+    global gpio_devices
+
+    # ถ้า freq หรือ duty เป็น 0 → ปิดและลบอุปกรณ์
+    if freq == 0 or duty == 0:
+        if pin in gpio_devices:
+            gpio_devices[pin].close()
+            del gpio_devices[pin]
+            print(f"🛑 ปิดและคืน GPIO{pin} เพราะ freq หรือ duty = 0")
+        else:
+            print(f"⚠️ GPIO{pin} ยังไม่ถูกใช้งาน ไม่มีอุปกรณ์ให้ปิด")
+        return  # ไม่ต้องทำงานต่อ
+
+    # ถ้ายังไม่เคยสร้าง PWM บน pin นี้
+    if pin not in gpio_devices or not isinstance(gpio_devices[pin], PWMOutputDevice):
+        gpio_devices[pin] = PWMOutputDevice(pin=pin, frequency=freq, initial_value=duty)
+        print(f"🔧 สร้าง PWMOutputDevice(pin={pin}, freq={freq}, duty={duty})")
+    else:
+        pwm_device = gpio_devices[pin]
+        if pwm_device.frequency != freq:
+            pwm_device.frequency = freq
+            print(f"🎚 ปรับ frequency GPIO{pin} → {freq}Hz")
+        pwm_device.value = duty
+        print(f"⚡ ปรับ duty GPIO{pin} → {duty*100:.1f}%")
+
+def digitalRead(pin):
+    if pin not in gpio_devices or not isinstance(gpio_devices[pin], DigitalInputDevice):
+        gpio_devices[pin] = DigitalInputDevice(pin=pin, pull_up=False)
+        print(f"📥 สร้าง DigitalInputDevice(GPIO{pin})")
+
+    value = gpio_devices[pin].value
+    gpio_devices[pin].close()
+    del gpio_devices[pin]
+    print(f"📌 GPIO{pin} = {value}")
+    return value
+
+def setupRisingInterrupt(pin, mode):
+    global gpio_devices
+
+    if mode == "attach":
+        # สร้างอุปกรณ์ ถ้ายังไม่มี หรือชนิดไม่ตรง
+        if pin not in gpio_devices or not isinstance(gpio_devices[pin], DigitalInputDevice):
+            gpio_devices[pin] = DigitalInputDevice(pin=pin, pull_up=False)
+            print(f"🔗 สร้าง DigitalInputDevice(GPIO{pin}) สำหรับ interrupt")
+
+        device = gpio_devices[pin]
+
+        # สร้างฟังก์ชัน interrupt ด้านใน
+        def on_rising():
+            print(f"🚨 ตรวจพบขอบขาขึ้นที่ GPIO{pin}")
+
+        device.when_activated = on_rising
+        print(f"✅ ติดตั้ง interrupt (ขอบขาขึ้น) สำเร็จที่ GPIO{pin}")
+
+    elif mode == "detach":
+        if pin in gpio_devices and isinstance(gpio_devices[pin], DigitalInputDevice):
+            gpio_devices[pin].when_activated = None
+            gpio_devices[pin].close()
+            del gpio_devices[pin]
+            print(f"🧹 ยกเลิก interrupt และคืน GPIO{pin} เรียบร้อยแล้ว")
+        else:
+            print(f"⚠️ ไม่พบอุปกรณ์ DigitalInput บน GPIO{pin} เพื่อถอด")
+
+    else:
+        print("❌ mode ต้องเป็น 'attach' หรือ 'detach' เท่านั้น")
 
 class TM1637:
     """Driver for TM1637 7-segment display using lgpio"""
@@ -182,6 +269,123 @@ def read_dht11(pin_number,mode):
         dht.exit()
         return None
 
+def ultrasonic(trig, echo):
+    sensor = DistanceSensor(trigger=trig, echo=echo, max_distance=2)
+    distance = sensor.distance * 100
+    sensor.close()
+    return distance
+
+class LCD:
+    def __init__(self, pi_rev , i2c_addr, backlight = True):
+
+        # device constants
+        self.I2C_ADDR  = i2c_addr
+        self.LCD_WIDTH = 16   # Max. characters per line
+
+        self.LCD_CHR = 1 # Mode - Sending data
+        self.LCD_CMD = 0 # Mode - Sending command
+
+        self.LCD_LINE_1 = 0x80 # LCD RAM addr for line one
+        self.LCD_LINE_2 = 0xC0 # LCD RAM addr for line two
+
+        if backlight:
+            # on
+            self.LCD_BACKLIGHT  = 0x08
+        else:
+            # off
+            self.LCD_BACKLIGHT = 0x00
+
+        self.ENABLE = 0b00000100 # Enable bit
+
+        # Timing constants
+        self.E_PULSE = 0.0005
+        self.E_DELAY = 0.0005
+
+        # Open I2C interface
+        if pi_rev == 2:
+            # Rev 2 Pi uses 1
+            self.bus = smbus.SMBus(1)
+        elif pi_rev == 1:
+            # Rev 1 Pi uses 0
+            self.bus = smbus.SMBus(0)
+        else:
+            raise ValueError('pi_rev param must be 1 or 2')
+
+        # Initialise display
+        self.lcd_byte(0x33, self.LCD_CMD) # 110011 Initialise
+        self.lcd_byte(0x32, self.LCD_CMD) # 110010 Initialise
+        self.lcd_byte(0x06, self.LCD_CMD) # 000110 Cursor move direction
+        self.lcd_byte(0x0C, self.LCD_CMD) # 001100 Display On,Cursor Off, Blink Off
+        self.lcd_byte(0x28, self.LCD_CMD) # 101000 Data length, number of lines, font size
+        self.lcd_byte(0x01, self.LCD_CMD) # 000001 Clear display
+
+    def lcd_byte(self, bits, mode):
+        # Send byte to data pins
+        # bits = data
+        # mode = 1 for data, 0 for command
+
+        bits_high = mode | (bits & 0xF0) | self.LCD_BACKLIGHT
+        bits_low = mode | ((bits<<4) & 0xF0) | self.LCD_BACKLIGHT
+
+        # High bits
+        self.bus.write_byte(self.I2C_ADDR, bits_high)
+        self.toggle_enable(bits_high)
+
+        # Low bits
+        self.bus.write_byte(self.I2C_ADDR, bits_low)
+        self.toggle_enable(bits_low)
+
+    def toggle_enable(self, bits):
+        sleep(self.E_DELAY)
+        self.bus.write_byte(self.I2C_ADDR, (bits | self.ENABLE))
+        sleep(self.E_PULSE)
+        self.bus.write_byte(self.I2C_ADDR,(bits & ~self.ENABLE))
+        sleep(self.E_DELAY)
+
+    def message(self, string, line = 1):
+        # display message string on LCD line 1 or 2
+        if line == 1:
+            lcd_line = self.LCD_LINE_1
+        elif line == 2:
+            lcd_line = self.LCD_LINE_2
+        else:
+            raise ValueError('line number must be 1 or 2')
+
+        string = string.ljust(self.LCD_WIDTH," ")
+
+        self.lcd_byte(lcd_line, self.LCD_CMD)
+
+        for i in range(self.LCD_WIDTH):
+            self.lcd_byte(ord(string[i]), self.LCD_CHR)
+
+    def clear(self):
+        # clear LCD display
+        self.lcd_byte(0x01, self.LCD_CMD)
+
+def read_bme280(address, mode):
+    bus = smbus.SMBus(1)
+    calibration_params = bme280.load_calibration_params(bus, address)
+    data = bme280.sample(bus, address, calibration_params)
+
+    if mode == "T":
+        return round(data.temperature, 2)
+    elif mode == "P":
+        return round(data.pressure, 2)
+    elif mode == "H":
+        return round(data.humidity, 2)
+    elif mode == "A":
+        pressure = data.pressure
+        altitude = 44330 * (1 - (pressure / 1013.25) ** (1/5.255))
+        return round(altitude, 2)
+    else:
+        return None
+
+def servo(pin, angle):
+    motor = AngularServo(pin, min_angle=0, max_angle=180)
+    motor.angle = angle
+    sleep(1)
+    motor.close()
+
 # แปลงคำสั่ง
 def parse_command(command_str):
     try:
@@ -208,16 +412,29 @@ def execute_command(cmd_name, cmd_id, cmd_args):
     success = 0
     try:
 
-        if cmd_name == 'dw':  # เขียน Digital
+        if cmd_name == 'dw':  # digital write
             if len(cmd_args) == 2:                                                                                                                                                                                                                                                                   
                 dwpin, dwvalue = int(cmd_args[0]), int(cmd_args[1])
-                digitalWrite = DigitalOutputDevice(pin=dwpin)
-                if dwvalue == 1:
-                    digitalWrite.on()
-                elif dwvalue == 0:
-                    digitalWrite.off()
-                else:
-                    print("Invalid value")
+                digitalWrite(dwpin, dwvalue)
+                success = 1
+
+        elif cmd_name == 'aw':  # analog write
+            if len(cmd_args) == 3:
+                awpin, awfreq, awduty = int(cmd_args[0]), int(cmd_args[1]), float(cmd_args[2])
+                analogWrite(awpin, awfreq, awduty)
+                success = 1
+
+        elif cmd_name == 'dr':  # digital read
+            if len(cmd_args) == 2:
+                drpin = int(cmd_args[0])
+                dr_value = digitalRead(drpin)
+                print(f"Value: {dr_value}")
+                success = 1
+
+        elif cmd_name == 'itr':  # set interrupt pin on rising edge
+            if len(cmd_args) == 2:
+                pin,mode = int(cmd_args[0]), cmd_args[1]
+                setupRisingInterrupt(pin, mode)
                 success = 1
 
         elif cmd_name == 'sg':  # display number on 7-segment
@@ -232,15 +449,46 @@ def execute_command(cmd_name, cmd_id, cmd_args):
                     tm.cleanup()
                 success = 1
 
-        elif cmd_name == 'd11':
+        elif cmd_name == 'd11': # read DHT11 sensor
             if len(cmd_args) == 2:
                 pin, mode = int(cmd_args[0]), cmd_args[1]
                 result = read_dht11(pin, mode)
                 print(f"Result: {result}")
                 success = 1
 
-        
+        elif cmd_name == 'ultra':   # read ultrasonic sensor
+            if len(cmd_args) == 2:
+                trig, echo = int(cmd_args[0]), int(cmd_args[1])
+                distance = ultrasonic(trig, echo)
+                print(f"Distance: {distance}")
+                success = 1
 
+        elif cmd_name == 'srv': # move servo
+            if len(cmd_args) == 2:
+                pin, angle = int(cmd_args[0]), int(cmd_args[1])
+                servo(pin, angle)
+                success = 1
+
+        elif cmd_name == 'lcd': # write to LCD
+            print({len(cmd_args)})
+            if len(cmd_args) == 3:
+                i2c_addr, text1, text2 = int(cmd_args[0],0), cmd_args[1], cmd_args[2]
+                print(f"i2c_addr: {i2c_addr}, text1: {text1}, text2: {text2}")
+                lcd = LCD(2, i2c_addr, True)
+                print(f"LCD: {text1}, {text2}")
+                lcd.message(text1, 1)
+                lcd.message(text2, 2)
+                success = 1
+
+        elif cmd_name == 'b280': # read BME280 sensor
+            if len(cmd_args) == 2:
+                address, mode = int(cmd_args[0],0), cmd_args[1]
+                print(f"Address: {address}, Mode: {mode}")
+                result = read_bme280(address, mode)
+                print(f"Result: {result}")
+                success = 1
+
+    
     except Exception as e:
         print(f"Execution error: {e}")
 
