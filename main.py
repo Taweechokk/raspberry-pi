@@ -7,6 +7,10 @@ import board
 import adafruit_dht
 import smbus
 import bme280
+import os
+import glob
+from gpiozero.tones import Tone
+
 
 # ตั้งค่าพอร์ตอนุกรมเสมือน
 SERIAL_PORT = "/dev/pts/4"  # ใช้ Virtual Serial Port ที่สร้างจาก tty0tty
@@ -23,21 +27,12 @@ COMMANDS = {
     'aw': 'write_analog',
     'itr': 'set_interrupt',
 
-    # Built-in
-    'k_bn': 'kb_button',
-    'k_tm': 'kb_temperature',
-    'k_mt': 'kb_matrix_text',
-    'k_mp': 'kb_matrix_pattern',
-    'k_ld': 'kb_led',
-    'k_gy': 'kb_gyro',
-
     # Sensors
     'ultra': 'read_ultrasonic',
     'b280': 'read_bme280',
     'd11': 'read_dht11',
     'ds18': 'read_ds18b20',
     'mic': 'read_microphone',
-    'mpu': 'read_mpu6050',
 
     # Actuators
     'buz': 'play_buzzer',
@@ -46,7 +41,6 @@ COMMANDS = {
     'sg': 'write_7segment',
     'rgb': 'write_rgb_led'
 }
-
 
 # init
 def __patched_init(self, chip=None):
@@ -380,11 +374,114 @@ def read_bme280(address, mode):
     else:
         return None
 
+def ds18b20():
+    # เปิดใช้งาน 1-Wire Interface (กรณีไม่ได้เปิดไว้แล้ว)
+        print("Loading 1-Wire kernel modules...")
+        os.system('modprobe w1-gpio')
+        os.system('modprobe w1-therm')
+
+        # ค้นหา device
+        base_dir = '/sys/bus/w1/devices/'
+        device_folders = glob.glob(base_dir + '28*')
+        if not device_folders:
+            return {"error": "No DS18B20 device found"}
+        
+        device_file = device_folders[0] + '/w1_slave'
+
+        # อ่านข้อมูลจากไฟล์
+        with open(device_file, 'r') as f:
+            lines = f.readlines()
+
+        while lines[0].strip()[-3:] != 'YES':
+            sleep(0.2)
+            with open(device_file, 'r') as f:
+                lines = f.readlines()
+
+        equals_pos = lines[1].find('t=')
+        if equals_pos != -1:
+            temp_string = lines[1][equals_pos+2:]
+            temp_c = float(temp_string) / 1000.0
+            return round(temp_c, 2)
+
+        return {"error": "Invalid temperature format"}
+
+def LEDrgb(pin_red, pin_green, pin_blue, val_red, val_green, val_blue):
+    """
+    ฟังก์ชันควบคุม RGB LED แบบ PWM พร้อมบันทึกไว้ใน gpio_devices
+    หากค่า R, G, B = 0 ทั้งหมด จะปิด LED และคืนพิน
+    
+    Parameters:
+        pin_red (int): พินสีแดง
+        pin_green (int): พินสีเขียว
+        pin_blue (int): พินสีน้ำเงิน
+        val_red (float): ความสว่างสีแดง (0.0 - 1.0)
+        val_green (float): ความสว่างสีเขียว (0.0 - 1.0)
+        val_blue (float): ความสว่างสีน้ำเงิน (0.0 - 1.0)
+    """
+    key = f"rgb_{pin_red}_{pin_green}_{pin_blue}"
+
+    # หากมีอุปกรณ์นี้อยู่แล้ว ให้ดึงมาใช้ซ้ำ
+    if key in gpio_devices:
+        led = gpio_devices[key]
+    else:
+        led = RGBLED(pin_red, pin_green, pin_blue, pwm=True)
+        gpio_devices[key] = led
+
+    # ถ้าค่าทุกสีเป็น 0 → ปิดและคืนพิน
+    if val_red == 0.0 and val_green == 0.0 and val_blue == 0.0:
+        led.off()
+        led.close()
+        del gpio_devices[key]
+        print(f"LED RGB at {key} turned OFF and pin released")
+    else:
+        led.color = (val_red, val_green, val_blue)
+        print(f"LED RGB at {key} set to color = ({val_red}, {val_green}, {val_blue})")
+
+def play_tonal_buzzer(pin: int, tone_hz: float):
+    """
+    ฟังก์ชันเล่นเสียงด้วย TonalBuzzer ที่สามารถรับ tone แบบ Hz
+    - หาก tone_hz = 0 → ปิดเสียงและคืนพิน
+
+    Parameters:
+        pin (int): พินที่ต่อกับ Buzzer
+        tone_hz (float): ความถี่เสียงเป็น Hz (เช่น 440.0), ถ้า 0 คือหยุด
+    """
+    key = f"tonal_buzzer_{pin}"
+
+    # หาก tone_hz = 0 → ปิดและคืนพิน
+    if tone_hz == 0:
+        if key in gpio_devices:
+            buzzer = gpio_devices[key]
+            buzzer.stop()
+            buzzer.close()
+            del gpio_devices[key]
+            print(f"Tonal Buzzer on pin {pin} stopped and released.")
+        else:
+            print(f"No active buzzer on pin {pin} to stop.")
+        return
+
+    # เริ่มเล่นเสียง
+    if key not in gpio_devices:
+        buzzer = TonalBuzzer(pin)
+        gpio_devices[key] = buzzer
+    else:
+        buzzer = gpio_devices[key]
+
+    try:
+        buzzer.play(Tone(tone_hz))
+        print(f"Playing tone {tone_hz} Hz on pin {pin}")
+    except Exception as e:
+        print(f"Error: {e}")
+
 def servo(pin, angle):
-    motor = AngularServo(pin, min_angle=0, max_angle=180)
-    motor.angle = angle
-    sleep(1)
-    motor.close()
+    servo = AngularServo(pin,
+                     min_angle=0,
+                     max_angle=180,
+                     min_pulse_width=0.0005,
+                     max_pulse_width=0.0025)
+    servo.angle = angle
+    sleep(0.4)  # รอให้ servo ขยับเสร็จ
+    servo.close()
 
 # แปลงคำสั่ง
 def parse_command(command_str):
@@ -488,6 +585,24 @@ def execute_command(cmd_name, cmd_id, cmd_args):
                 print(f"Result: {result}")
                 success = 1
 
+        elif cmd_name == 'ds18': # read DS18B20 sensor
+            if len(cmd_args) == 0:
+                result = ds18b20()
+                print(f"Result: {result}")
+                success = 1
+
+        elif cmd_name == 'rgb':  # write to RGB LED
+            if len(cmd_args) == 6:
+                pin_red, pin_green, pin_blue = int(cmd_args[0]), int(cmd_args[1]), int(cmd_args[2])
+                val_red, val_green, val_blue = float(cmd_args[3]), float(cmd_args[4]), float(cmd_args[5])
+                LEDrgb(pin_red, pin_green, pin_blue, val_red, val_green, val_blue)
+                success = 1
+
+        elif cmd_name == 'buz':  # play buzzer
+            if len(cmd_args) == 2:
+                pin, tone_hz = int(cmd_args[0]), float(cmd_args[1])
+                play_tonal_buzzer(pin, tone_hz)
+                success = 1
     
     except Exception as e:
         print(f"Execution error: {e}")
