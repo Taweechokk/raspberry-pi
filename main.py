@@ -13,8 +13,8 @@ from gpiozero.tones import Tone
 
 
 # ตั้งค่าพอร์ตอนุกรมเสมือน
-SERIAL_PORT = "/dev/pts/4"  # ใช้ Virtual Serial Port ที่สร้างจาก tty0tty
-BAUD_RATE = 9600
+SERIAL_PORT = "/dev/pts/5"  # ใช้ Virtual Serial Port ที่สร้างจาก tty0tty
+BAUD_RATE = 115200
 
 # ser = serial.Serial('/dev/pts/5', baudrate=9600, timeout=1)
 
@@ -135,6 +135,12 @@ def setupRisingInterrupt(pin, mode):
 
     else:
         print("❌ mode ต้องเป็น 'attach' หรือ 'detach' เท่านั้น")
+
+def analogRead(channel):
+    adc = MCP3008(channel=channel)
+    voltage = round(adc.value *5, 2)        # แปลงเป็นแรงดันไฟฟ้า (0-5V)
+    adc.close()
+    return voltage
 
 class TM1637:
     """Driver for TM1637 7-segment display using lgpio"""
@@ -515,6 +521,13 @@ def execute_command(cmd_name, cmd_id, cmd_args):
                 digitalWrite(dwpin, dwvalue)
                 success = 1
 
+        elif cmd_name == 'ar':  # analog read
+            if len(cmd_args) == 1:
+                ar_channel = int(cmd_args[0])
+                ar_value = analogRead(ar_channel)
+                print(f"Value: {ar_value}")
+                success = 1
+
         elif cmd_name == 'aw':  # analog write
             if len(cmd_args) == 3:
                 awpin, awfreq, awduty = int(cmd_args[0]), int(cmd_args[1]), float(cmd_args[2])
@@ -522,7 +535,7 @@ def execute_command(cmd_name, cmd_id, cmd_args):
                 success = 1
 
         elif cmd_name == 'dr':  # digital read
-            if len(cmd_args) == 2:
+            if len(cmd_args) == 1:
                 drpin = int(cmd_args[0])
                 dr_value = digitalRead(drpin)
                 print(f"Value: {dr_value}")
